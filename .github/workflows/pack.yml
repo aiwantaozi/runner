@@ -101,9 +101,9 @@ on:
         default: false
 
 env:
-  INPUT_USERNAME: gpustack
+  INPUT_USERNAME: micheliac
   INPUT_PASSWORD: ${{ secrets.CI_DOCKERHUB_PASSWORD }}
-  INPUT_NAMESPACE: gpustack
+  INPUT_NAMESPACE: micheliac
   INPUT_REPOSITORY: runner
   INPUT_CACHE_REPOSITORY: runner-build-cache
 
