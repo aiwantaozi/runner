@@ -8,6 +8,7 @@ ARG VLLM_TORCH_VERSION=2.10.0
 ARG VLLM_LMCACHE_VERSION=0.4.3
 ARG VLLM_LMCACHE_ASCEND_VERSION=${VLLM_LMCACHE_VERSION}
 ARG VLLM_MOONCAKE_VERSION=0.3.11
+ARG VLLM_ROUTER_VERSION=0.1.15
 ARG VLLM_OMNI_COMMIT=4a24a517
 
 FROM ${CANN_BASE_IMAGE} AS vllm-build
@@ -256,6 +257,36 @@ ARG TARGETPLATFORM
 ARG TARGETOS
 ARG TARGETARCH
 
+## Install vLLM Router
+
+ARG VLLM_ROUTER_VERSION
+
+RUN <<EOF
+    # vLLM Router
+    #
+    # The PD router GPUStack renders for a disaggregated group. Without it in
+    # the image there is no router to run, and the group either falls back to
+    # an engine example script (no metrics, no circuit breaker, no health
+    # check) or does not start at all.
+    #
+    # The index is named explicitly because the base image ships a mirror that
+    # does not carry this package: `pip install vllm-router` there fails with
+    # "from versions: none", which reads like a bad version pin rather than a
+    # missing mirror. Measured on the CANN base.
+    uv pip install \
+        --index-url https://pypi.org/simple \
+        vllm-router==${VLLM_ROUTER_VERSION}
+
+    # Fail the build rather than ship an image whose router is missing: the
+    # alternative surfaces as a container that exits at deploy time, one
+    # layer away from anything that explains it.
+    command -v vllm-router >/dev/null
+
+    # Cleanup
+    rm -rf /var/tmp/* \
+        && rm -rf /tmp/*
+EOF
+
 ## Install Ray
 
 RUN <<EOF
@@ -346,6 +377,33 @@ RUN --mount=type=bind,from=vllm-build-mooncake,source=/,target=/mooncake,rw <<EO
     # Install
     uv pip install --no-build-isolation \
         /mooncake/workspace/*.whl
+
+    # Let libtransfer_engine.so find the transport plugins next to it.
+    #
+    # The install puts both in ${prefix}/lib, and libtransfer_engine.so lists
+    # ascend_transport.so as a NEEDED dependency, but its RUNPATH names only
+    # the CANN lib64 directory -- not its own. Nothing else covers the gap
+    # either: ldconfig skips these plugins because the names have no "lib"
+    # prefix, so ${prefix}/lib being on the loader's config path does not put
+    # them in the cache, and ${prefix}/lib is not one of the two default
+    # directories the loader scans directly. Measured on
+    # cann9.0-910b-vllm0.20.2: `import mooncake.engine` raised
+    # `ascend_transport.so: cannot open shared object file` and every Mooncake
+    # PD launch died there, before the engine had said anything about KV
+    # transfer at all.
+    #
+    # $ORIGIN rather than a literal path so the fix survives a relocation, and
+    # appended rather than prepended so the existing CANN entry keeps winning
+    # for any name that resolves in both.
+    if [[ -f /usr/local/lib/libtransfer_engine.so ]]; then
+        patchelf --set-rpath \
+            "$(patchelf --print-rpath /usr/local/lib/libtransfer_engine.so):\$ORIGIN" \
+            /usr/local/lib/libtransfer_engine.so
+        if ldd /usr/local/lib/libtransfer_engine.so | grep -q "not found"; then
+            ldd /usr/local/lib/libtransfer_engine.so
+            exit 1
+        fi
+    fi
 
     # Cleanup
     rm -rf /var/tmp/* \
