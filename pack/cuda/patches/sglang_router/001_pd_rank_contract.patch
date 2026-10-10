@@ -1,0 +1,142 @@
+--- a/src/core/worker_service.rs
++++ b/src/core/worker_service.rs
+@@ -310,6 +310,18 @@
+         })
+     }
+ 
++    fn removal_url(&self, worker_id: &WorkerId) -> Result<String, WorkerServiceError> {
++        // A rank UUID addresses the physical group for the DP removal workflow.
++        // Reserved parent UUIDs must also work while registration is pending.
++        self.worker_registry
++            .get(worker_id)
++            .map(|worker| worker.endpoint_url("").to_string())
++            .or_else(|| self.worker_registry.get_url_by_id(worker_id))
++            .ok_or_else(|| WorkerServiceError::NotFound {
++                worker_id: worker_id.as_str().to_string(),
++            })
++    }
++
+     /// Delete a worker by ID (submits async job)
+     pub async fn delete_worker(
+         &self,
+@@ -317,12 +329,7 @@
+     ) -> Result<DeleteWorkerResult, WorkerServiceError> {
+         let worker_id = self.parse_worker_id(worker_id_raw)?;
+ 
+-        let url = self
+-            .worker_registry
+-            .get_url_by_id(&worker_id)
+-            .ok_or_else(|| WorkerServiceError::NotFound {
+-                worker_id: worker_id_raw.to_string(),
+-            })?;
++        let url = self.removal_url(&worker_id)?;
+ 
+         let job = Job::RemoveWorker { url: url.clone() };
+ 
+@@ -364,3 +371,44 @@
+         Ok(UpdateWorkerResult { worker_id, url })
+     }
+ }
++
++#[cfg(test)]
++mod group_removal_tests {
++    use super::*;
++    use crate::core::{
++        steps::worker::local::find_workers_by_url, BasicWorkerBuilder, DPAwareWorkerBuilder,
++    };
++
++    #[test]
++    fn rank_ids_resolve_to_their_entire_physical_group() {
++        let registry = Arc::new(WorkerRegistry::new());
++        let service = WorkerService::new(
++            registry.clone(),
++            Arc::new(std::sync::OnceLock::new()),
++            RouterConfig::default(),
++        );
++        let mut ids = Vec::new();
++        for rank in 0..2 {
++            ids.push(registry.register(Arc::new(
++                DPAwareWorkerBuilder::new("http://p:80", rank, 2).build(),
++            )));
++        }
++        registry.register(Arc::new(
++            DPAwareWorkerBuilder::new("http://other:80", 0, 1).build(),
++        ));
++        for id in ids {
++            let url = service.removal_url(&id).unwrap();
++            assert_eq!(url, "http://p:80");
++            let workers = find_workers_by_url(&registry, &url, true);
++            assert_eq!(workers.len(), 2);
++            assert!(workers
++                .iter()
++                .all(|worker| worker.endpoint_url("") == "http://p:80"));
++        }
++        let parent = registry.reserve_id_for_url("http://pending:80");
++        assert_eq!(service.removal_url(&parent).unwrap(), "http://pending:80");
++        let basic = registry.register(Arc::new(BasicWorkerBuilder::new("http://basic:80").build()));
++        let url = service.removal_url(&basic).unwrap();
++        assert_eq!(find_workers_by_url(&registry, &url, false).len(), 1);
++    }
++}
+--- a/src/core/worker.rs
++++ b/src/core/worker.rs
+@@ -1105,6 +1105,11 @@
+ 
+     async fn prepare_request(&self, mut req: serde_json::Value) -> WorkerResult<serde_json::Value> {
+         if let Some(map) = req.as_object_mut() {
++            // Both SRT spellings must identify the rank selected by the router.
++            map.insert(
++                "routed_dp_rank".to_string(),
++                serde_json::json!(self.dp_rank),
++            );
+             map.insert(
+                 "data_parallel_rank".to_string(),
+                 serde_json::json!(self.dp_rank),
+--- a/src/routers/http/pd_router.rs
++++ b/src/routers/http/pd_router.rs
+@@ -356,8 +356,18 @@
+         prefill: &dyn Worker,
+         decode: &dyn Worker,
+     ) -> Result<(PreparedWorkerRequest<'a>, PreparedWorkerRequest<'a>), String> {
++        let prefill_json_request = if prefill.dp_rank().is_some() {
++            let mut request = json_request.clone();
++            if let Some(map) = request.as_object_mut() {
++                // Only decode may carry the prefill-location hint.
++                map.remove("disagg_prefill_dp_rank");
++            }
++            Cow::Owned(request)
++        } else {
++            Cow::Borrowed(json_request)
++        };
+         let prefill_request =
+-            Self::prepare_worker_request(route, prefill, Cow::Borrowed(json_request)).await?;
++            Self::prepare_worker_request(route, prefill, prefill_json_request).await?;
+         let decode_json_request =
+             Self::inject_prefill_dp_rank_for_decode(Cow::Borrowed(json_request), prefill)?;
+         let decode_request =
+@@ -1918,6 +1928,9 @@
+             "bootstrap_host": "prefill",
+             "bootstrap_port": 8998,
+             "bootstrap_room": 1234,
++            "routed_dp_rank": 3,
++            "data_parallel_rank": 3,
++            "disagg_prefill_dp_rank": 3,
+         });
+ 
+         let (prefill_request, decode_request) =
+@@ -1930,6 +1943,7 @@
+             "http://prefill:30000/v1/completions"
+         );
+         assert_eq!(prefill_request.body["data_parallel_rank"], 2);
++        assert_eq!(prefill_request.body["routed_dp_rank"], 2);
+         assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
+ 
+         assert_eq!(
+@@ -1937,6 +1951,7 @@
+             "http://decode:30001/v1/completions"
+         );
+         assert_eq!(decode_request.body["data_parallel_rank"], 1);
++        assert_eq!(decode_request.body["routed_dp_rank"], 1);
+         assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
+         assert_eq!(decode_request.body["bootstrap_room"], 1234);
+         assert!(matches!(prefill_request.body, Cow::Owned(_)));

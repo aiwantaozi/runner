@@ -156,6 +156,28 @@ Define the service's named final target and preserve its runtime ancestry, platf
 Active recipes do not require dependency-probe arguments, shared mounts, embedded metadata, or export stages.
 Pack collects dependencies from the final image through the central collector.
 
+## SGLang PD gateway build
+
+This build is a deferred development snapshot, not a released recipe change.
+The repository root `DP_AWARE_DEFERRED.md` records dependencies and resumption
+conditions. No service image or measured catalog update was produced.
+
+The CUDA SGLang recipe builds the gateway separately from the engine. It pins
+SMG source revision `f620d733d256c535b00d6e2f6b8e43c27fa81214`, which contains PD
+rank dispatch, and applies `pack/cuda/patches/sglang_router/001_pd_rank_contract.patch`.
+The patch makes deletion by a discovered rank UUID remove its physical group,
+aligns both SRT request-rank spellings, and keeps the prefill-location hint on D.
+
+The build runs the group-removal and PD-request regression tests before producing
+`sglang-router 0.3.2+gpustack.dp1`. GPUStack requires this distinct package version
+when its managed SGLang router enables `--dp-aware`; the published `0.3.2` wheel
+has different behavior. The final image keeps the engine version unchanged and
+replaces the inherited router wheel.
+
+Source compilation and CPU tests establish the router contract. They do not
+establish final-image execution, GPU KV transfer, or a published support row.
+Pack must collect final-image dependencies before the generated catalog changes.
+
 ## Adding a backend or service
 
 For a new backend, create its directory under `pack/` and one `Dockerfile.<service>` per supported service.

@@ -4,6 +4,10 @@ ARG CUDA_VERSION=13.0.1
 ARG CUDA_ARCHS
 ARG SGLANG_BASE_IMAGE=lmsysorg/sglang:v0.5.18-cu130
 ARG SGLANG_VERSION=0.5.18
+# PD rank dispatch is absent from the published 0.3.2 wheel. Pin the SMG
+# source with that fix; the local patch owns both request-rank spellings and
+# makes rank UUID deletion group-wide.
+ARG SGLANG_ROUTER_COMMIT=f620d733d256c535b00d6e2f6b8e43c27fa81214
 ARG SGLANG_TORCH_VERSION=2.13.0
 ARG SGLANG_TORCH_CUDA_VERSION=${CUDA_VERSION}
 ## Keep >= 0.4.6 and in sync with the ROCm and vLLM pins: SGLang's lmc_radix_cache.py imports
@@ -206,12 +210,48 @@ RUN <<EOF
 EOF
 
 
+FROM sglang-build AS sglang-build-router
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+
+ARG SGLANG_ROUTER_COMMIT
+COPY patches/sglang_router /tmp/router-patches
+
+RUN <<EOF
+    apt-get update -y
+    apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler
+    curl --retry 3 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh
+    bash /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.90.0
+    source /root/.cargo/env
+    mkdir -p /tmp/smg
+    curl --retry 3 -fL "https://github.com/sgl-project/sglang/archive/${SGLANG_ROUTER_COMMIT}.tar.gz" \
+        | tar -xz -C /tmp/smg --strip-components=1
+    cd /tmp/smg/sgl-model-gateway
+    git apply /tmp/router-patches/001_pd_rank_contract.patch
+    # These contract tests do not require an inference engine or GPU.
+    cargo test --lib group_removal_tests
+    cargo test --lib test_prepare_pd_worker_requests
+    # Distinguish this contract from the unpatched wheel at the same public version.
+    sed -i 's/^version = "0.3.2"$/version = "0.3.2+gpustack.dp1"/' bindings/python/pyproject.toml
+    sed -i 's/^version = "0.3.2"$/version = "0.3.2+gpustack.dp1"/' bindings/python/Cargo.toml
+    uv pip install 'maturin>=1.0,<2.0'
+    maturin build --release --out /opt/router-wheels --manifest-path bindings/python/Cargo.toml
+EOF
+
+
 FROM sglang-build AS sglang
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 
 ARG TARGETPLATFORM
 ARG TARGETOS
 ARG TARGETARCH
+
+COPY --from=sglang-build-router /opt/router-wheels /tmp/router-wheels
+RUN <<EOF
+    uv pip install --no-deps --reinstall /tmp/router-wheels/*.whl
+    python -c 'import importlib.metadata as m; assert m.version("sglang-router") == "0.3.2+gpustack.dp1"'
+    python -m sglang_router.launch_router --help >/dev/null
+    rm -rf /tmp/router-wheels
+EOF
 
 ## Install NVIDIA HPC-X,
 ## See https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cuda-dl-base/layers?version=24.12-cuda12.6-devel-ubuntu24.04.
